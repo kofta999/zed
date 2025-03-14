@@ -42,7 +42,10 @@ use std::{
 
 use text::BufferId;
 use util::{debug_panic, maybe, ResultExt};
-use worktree::{ProjectEntryId, RepositoryEntry, StatusEntry, WorkDirectory};
+use worktree::{
+    File, ProjectEntryId, RepositoryEntry, StatusEntry, UpdatedGitRepositoriesSet, WorkDirectory,
+    Worktree,
+};
 
 pub struct GitStore {
     state: GitStoreState,
@@ -268,6 +271,10 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_open_unstaged_diff);
         client.add_entity_request_handler(Self::handle_open_uncommitted_diff);
         client.add_entity_message_handler(Self::handle_update_diff_bases);
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self.state, GitStoreState::Local { .. })
     }
 
     pub fn shared(&mut self, remote_id: u64, client: AnyProtoClient, _cx: &mut App) {
@@ -653,9 +660,25 @@ impl GitStore {
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_) => {
                 cx.emit(GitEvent::GitStateUpdated);
             }
+            WorktreeStoreEvent::WorktreeAdded(worktree) => {
+                if self.is_local() {
+                    cx.subscribe(worktree, Self::on_worktree_event).detach();
+                }
+            }
             _ => {
                 cx.emit(GitEvent::FileSystemUpdated);
             }
+        }
+    }
+
+    fn on_worktree_event(
+        &mut self,
+        worktree: Entity<Worktree>,
+        event: &worktree::Event,
+        cx: &mut Context<Self>,
+    ) {
+        if let worktree::Event::UpdatedGitRepositories(changed_repos) = event {
+            self.local_worktree_git_repos_changed(worktree, changed_repos, cx);
         }
     }
 
@@ -750,170 +773,166 @@ impl GitStore {
         }
     }
 
-    // fn local_worktree_git_repos_changed(
-    //     this: &mut BufferStore,
-    //     worktree_handle: Entity<Worktree>,
-    //     changed_repos: &UpdatedGitRepositoriesSet,
-    //     cx: &mut Context<BufferStore>,
-    // ) {
-    //     debug_assert!(worktree_handle.read(cx).is_local());
+    fn local_worktree_git_repos_changed(
+        &mut self,
+        worktree_handle: Entity<Worktree>,
+        changed_repos: &UpdatedGitRepositoriesSet,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(worktree_handle.read(cx).is_local());
 
-    //     let mut diff_state_updates = Vec::new();
-    //     for buffer in this.opened_buffers.values() {
-    //         let OpenBuffer::Complete { buffer, diff_state } = buffer else {
-    //             continue;
-    //         };
-    //         let Some(buffer) = buffer.upgrade() else {
-    //             continue;
-    //         };
-    //         let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
-    //             continue;
-    //         };
-    //         if file.worktree != worktree_handle {
-    //             continue;
-    //         }
-    //         let diff_state = diff_state.read(cx);
-    //         if changed_repos
-    //             .iter()
-    //             .any(|(work_dir, _)| file.path.starts_with(work_dir))
-    //         {
-    //             let has_unstaged_diff = diff_state
-    //                 .unstaged_diff
-    //                 .as_ref()
-    //                 .is_some_and(|diff| diff.is_upgradable());
-    //             let has_uncommitted_diff = diff_state
-    //                 .uncommitted_diff
-    //                 .as_ref()
-    //                 .is_some_and(|set| set.is_upgradable());
-    //             diff_state_updates.push((
-    //                 buffer,
-    //                 file.path.clone(),
-    //                 has_unstaged_diff.then(|| diff_state.index_text.clone()),
-    //                 has_uncommitted_diff.then(|| diff_state.head_text.clone()),
-    //             ));
-    //         }
-    //     }
+        let mut diff_state_updates = Vec::new();
+        for (buffer_id, diff_state) in &self.diffs {
+            let Some(buffer) = self.buffer_store.read(cx).get(*buffer_id) else {
+                continue;
+            };
+            let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
+                continue;
+            };
+            if file.worktree != worktree_handle {
+                continue;
+            }
+            let diff_state = diff_state.read(cx);
+            if changed_repos
+                .iter()
+                .any(|(work_dir, _)| file.path.starts_with(work_dir))
+            {
+                let has_unstaged_diff = diff_state
+                    .unstaged_diff
+                    .as_ref()
+                    .is_some_and(|diff| diff.is_upgradable());
+                let has_uncommitted_diff = diff_state
+                    .uncommitted_diff
+                    .as_ref()
+                    .is_some_and(|set| set.is_upgradable());
+                diff_state_updates.push((
+                    buffer,
+                    file.path.clone(),
+                    has_unstaged_diff.then(|| diff_state.index_text.clone()),
+                    has_uncommitted_diff.then(|| diff_state.head_text.clone()),
+                ));
+            }
+        }
 
-    //     if diff_state_updates.is_empty() {
-    //         return;
-    //     }
+        if diff_state_updates.is_empty() {
+            return;
+        }
 
-    //     cx.spawn(move |this, mut cx| async move {
-    //         let snapshot =
-    //             worktree_handle.update(&mut cx, |tree, _| tree.as_local().unwrap().snapshot())?;
-    //         let diff_bases_changes_by_buffer = cx
-    //             .spawn(async move |cx| {
-    //                 let mut results = Vec::new();
-    //                 for (buffer, path, current_index_text, current_head_text) in diff_state_updates
-    //                 {
-    //                     log::debug!("reloading git state for buffer {}", path.display());
-    //                     let Some(local_repo) = snapshot.local_repo_for_path(&path) else {
-    //                         continue;
-    //                     };
-    //                     let Some(relative_path) = local_repo.relativize(&path).ok() else {
-    //                         continue;
-    //                     };
-    //                     let index_text = if current_index_text.is_some() {
-    //                         local_repo
-    //                             .repo()
-    //                             .load_index_text(relative_path.clone(), cx.clone())
-    //                             .await
-    //                     } else {
-    //                         None
-    //                     };
-    //                     let head_text = if current_head_text.is_some() {
-    //                         local_repo
-    //                             .repo()
-    //                             .load_committed_text(relative_path, cx.clone())
-    //                             .await
-    //                     } else {
-    //                         None
-    //                     };
+        cx.spawn(move |this, mut cx| async move {
+            let snapshot =
+                worktree_handle.update(&mut cx, |tree, _| tree.as_local().unwrap().snapshot())?;
+            let diff_bases_changes_by_buffer = cx
+                .spawn(async move |cx| {
+                    let mut results = Vec::new();
+                    for (buffer, path, current_index_text, current_head_text) in diff_state_updates
+                    {
+                        log::debug!("reloading git state for buffer {}", path.display());
+                        let Some(local_repo) = snapshot.local_repo_for_path(&path) else {
+                            continue;
+                        };
+                        let Some(relative_path) = local_repo.relativize(&path).ok() else {
+                            continue;
+                        };
+                        let index_text = if current_index_text.is_some() {
+                            local_repo
+                                .repo()
+                                .load_index_text(relative_path.clone(), cx.clone())
+                                .await
+                        } else {
+                            None
+                        };
+                        let head_text = if current_head_text.is_some() {
+                            local_repo
+                                .repo()
+                                .load_committed_text(relative_path, cx.clone())
+                                .await
+                        } else {
+                            None
+                        };
 
-    //                     // Avoid triggering a diff update if the base text has not changed.
-    //                     if let Some((current_index, current_head)) =
-    //                         current_index_text.as_ref().zip(current_head_text.as_ref())
-    //                     {
-    //                         if current_index.as_deref() == index_text.as_ref()
-    //                             && current_head.as_deref() == head_text.as_ref()
-    //                         {
-    //                             continue;
-    //                         }
-    //                     }
+                        // Avoid triggering a diff update if the base text has not changed.
+                        if let Some((current_index, current_head)) =
+                            current_index_text.as_ref().zip(current_head_text.as_ref())
+                        {
+                            if current_index.as_deref() == index_text.as_ref()
+                                && current_head.as_deref() == head_text.as_ref()
+                            {
+                                continue;
+                            }
+                        }
 
-    //                     let diff_bases_change =
-    //                         match (current_index_text.is_some(), current_head_text.is_some()) {
-    //                             (true, true) => Some(if index_text == head_text {
-    //                                 DiffBasesChange::SetBoth(head_text)
-    //                             } else {
-    //                                 DiffBasesChange::SetEach {
-    //                                     index: index_text,
-    //                                     head: head_text,
-    //                                 }
-    //                             }),
-    //                             (true, false) => Some(DiffBasesChange::SetIndex(index_text)),
-    //                             (false, true) => Some(DiffBasesChange::SetHead(head_text)),
-    //                             (false, false) => None,
-    //                         };
+                        let diff_bases_change =
+                            match (current_index_text.is_some(), current_head_text.is_some()) {
+                                (true, true) => Some(if index_text == head_text {
+                                    DiffBasesChange::SetBoth(head_text)
+                                } else {
+                                    DiffBasesChange::SetEach {
+                                        index: index_text,
+                                        head: head_text,
+                                    }
+                                }),
+                                (true, false) => Some(DiffBasesChange::SetIndex(index_text)),
+                                (false, true) => Some(DiffBasesChange::SetHead(head_text)),
+                                (false, false) => None,
+                            };
 
-    //                     results.push((buffer, diff_bases_change))
-    //                 }
+                        results.push((buffer, diff_bases_change))
+                    }
 
-    //                 results
-    //             })
-    //             .await;
+                    results
+                })
+                .await;
 
-    //         this.update(&mut cx, |this, cx| {
-    //             for (buffer, diff_bases_change) in diff_bases_changes_by_buffer {
-    //                 let Some(OpenBuffer::Complete { diff_state, .. }) =
-    //                     this.opened_buffers.get_mut(&buffer.read(cx).remote_id())
-    //                 else {
-    //                     continue;
-    //                 };
-    //                 let Some(diff_bases_change) = diff_bases_change else {
-    //                     continue;
-    //                 };
+            this.update(&mut cx, |this, cx| {
+                for (buffer, diff_bases_change) in diff_bases_changes_by_buffer {
+                    let Some(diff_state) = this.diffs.get(&buffer.read(cx).remote_id()) else {
+                        continue;
+                    };
+                    let Some(diff_bases_change) = diff_bases_change else {
+                        continue;
+                    };
 
-    //                 diff_state.update(cx, |diff_state, cx| {
-    //                     use proto::update_diff_bases::Mode;
+                    let downstream_client = this.downstream_client();
+                    diff_state.update(cx, |diff_state, cx| {
+                        use proto::update_diff_bases::Mode;
 
-    //                     let buffer = buffer.read(cx);
-    //                     if let Some((client, project_id)) = this.downstream_client.as_ref() {
-    //                         let buffer_id = buffer.remote_id().to_proto();
-    //                         let (staged_text, committed_text, mode) = match diff_bases_change
-    //                             .clone()
-    //                         {
-    //                             DiffBasesChange::SetIndex(index) => (index, None, Mode::IndexOnly),
-    //                             DiffBasesChange::SetHead(head) => (None, head, Mode::HeadOnly),
-    //                             DiffBasesChange::SetEach { index, head } => {
-    //                                 (index, head, Mode::IndexAndHead)
-    //                             }
-    //                             DiffBasesChange::SetBoth(text) => {
-    //                                 (None, text, Mode::IndexMatchesHead)
-    //                             }
-    //                         };
-    //                         let message = proto::UpdateDiffBases {
-    //                             project_id: *project_id,
-    //                             buffer_id,
-    //                             staged_text,
-    //                             committed_text,
-    //                             mode: mode as i32,
-    //                         };
+                        let buffer = buffer.read(cx);
+                        if let Some((client, project_id)) = downstream_client {
+                            let buffer_id = buffer.remote_id().to_proto();
+                            let (staged_text, committed_text, mode) = match diff_bases_change
+                                .clone()
+                            {
+                                DiffBasesChange::SetIndex(index) => (index, None, Mode::IndexOnly),
+                                DiffBasesChange::SetHead(head) => (None, head, Mode::HeadOnly),
+                                DiffBasesChange::SetEach { index, head } => {
+                                    (index, head, Mode::IndexAndHead)
+                                }
+                                DiffBasesChange::SetBoth(text) => {
+                                    (None, text, Mode::IndexMatchesHead)
+                                }
+                            };
+                            let message = proto::UpdateDiffBases {
+                                project_id: project_id.to_proto(),
+                                buffer_id,
+                                staged_text,
+                                committed_text,
+                                mode: mode as i32,
+                            };
 
-    //                         client.send(message).log_err();
-    //                     }
+                            client.send(message).log_err();
+                        }
 
-    //                     let _ = diff_state.diff_bases_changed(
-    //                         buffer.text_snapshot(),
-    //                         diff_bases_change,
-    //                         cx,
-    //                     );
-    //                 });
-    //             }
-    //         })
-    //     })
-    //     .detach_and_log_err(cx);
-    // }
+                        let _ = diff_state.diff_bases_changed(
+                            buffer.text_snapshot(),
+                            diff_bases_change,
+                            cx,
+                        );
+                    });
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
 
     pub fn all_repositories(&self) -> Vec<Entity<Repository>> {
         self.repositories.clone()
