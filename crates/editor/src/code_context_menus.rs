@@ -1254,10 +1254,10 @@ impl CompletionsMenu {
             WordStartMatch {
                 sort_exact: Reverse<i32>,
                 sort_snippet: Reverse<i32>,
+                sort_text: Option<&'a str>,
                 sort_score: Reverse<OrderedFloat<f64>>,
                 sort_positions: Vec<usize>,
                 sort_exact_case_matches: Reverse<usize>,
-                sort_text: Option<&'a str>,
                 sort_kind: usize,
                 sort_label: &'a str,
             },
@@ -1326,10 +1326,10 @@ impl CompletionsMenu {
                 MatchTier::WordStartMatch {
                     sort_exact,
                     sort_snippet,
+                    sort_text,
                     sort_score,
                     sort_positions,
                     sort_exact_case_matches,
-                    sort_text,
                     sort_kind,
                     sort_label,
                 }
